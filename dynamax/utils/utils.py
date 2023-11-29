@@ -1,4 +1,5 @@
 from functools import partial
+import dataclasses
 import jax.numpy as jnp
 import jax.random as jr
 from jax import jit
@@ -209,3 +210,17 @@ def psd_solve(A, b, diagonal_boost=1e-9):
 def symmetrize(A):
     """Symmetrize one or more matrices."""
     return 0.5 * (A + jnp.swapaxes(A, -1, -2))
+
+# Helper function to make a dataclass a JAX PyTree
+def register_pytree_node_dataclass(cls):
+    _flatten = lambda obj: jax.tree_flatten(dataclasses.asdict(obj))
+    _unflatten = lambda d, children: cls(**d.unflatten(children))
+    jax.tree_util.register_pytree_node(cls, _flatten, _unflatten)
+    return cls
+
+# Solve a linear regression given sufficient statistics
+def fit_linear_regression(ExxT, ExyT, EyyT, N, shrinkage=1e-4):
+    D_in, D_out = ExyT.shape[-2:]
+    W = psd_solve(ExxT + shrinkage * jnp.eye(D_in), ExyT).T
+    Sigma = (EyyT - W @ ExyT - ExyT.T @ W.T + W @ ExxT @ W.T) / N + shrinkage * jnp.eye(D_out)
+    return W, symmetrize(Sigma)
