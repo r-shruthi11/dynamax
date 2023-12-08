@@ -1,15 +1,10 @@
 import dataclasses
-import jax
 import jax.numpy as jnp
 import jax.random as jr
-import matplotlib.pyplot as plt
-import seaborn as sns
 
-from jax import grad, jit, vmap, lax
+from jax import vmap, lax
 from jax.nn import one_hot
-from jax.scipy.linalg import cho_factor, cho_solve
-from jaxtyping import Array, Float, PyTree
-from tqdm.auto import trange
+from jaxtyping import Array, Float
 from tensorflow_probability.substrates import jax as tfp
 
 tfd = tfp.distributions
@@ -19,7 +14,7 @@ MVN = tfd.MultivariateNormalFullCovariance
 from dynamax import hidden_markov_model as hmm
 from dynamax import linear_gaussian_ssm as lds
 from dynamax.linear_gaussian_ssm.inference import make_lgssm_params
-
+from dynamax.slds.laplace import block_tridiag_mvn_sample, laplace_approximation
 from dynamax.utils.utils import register_pytree_node_dataclass, fit_linear_regression
 
 @register_pytree_node_dataclass
@@ -39,6 +34,8 @@ class SLDSParams:
     emission_matrix : Float[Array, "emission_dim latent_dim"]
     emission_bias : Float[Array, "emission_dim"]
     emission_cov : Float[Array, "emission_dim emission_dim"]
+
+
 
 class SLDS:
     """
@@ -231,7 +228,8 @@ class SLDS:
 
         return lps, zs, xs, params
 
-    def _fit_laplace_em(self, emissions, initial_zs, initial_xs, initial_params, num_iters=100):
+    def _fit_laplace_em(self, key, emissions, initial_zs, initial_xs, initial_params,
+                        num_iters=100, n_discrete_samples=1):
         """
         Estimate the parameters of the SLDS and an approximate posterior distr.
         over latent states using Laplace EM. Specifically, the approximate
@@ -247,35 +245,50 @@ class SLDS:
         ys = emissions
         T = ys.shape[0]
 
-        def _update_discrete_states(zs, xs, params):
+        def _update_discrete_states(key, params, J_diag, J_lower_diag, h):
             """
             Update the discrete states to the coordinate-wise maximum using the
             Viterbi algorithm.
             """
-            pi0 = jnp.ones(K) / K
-            P = params.transition_matrix
             As = params.dynamics_matrices   # (K, D, D)
             bs = params.dynamics_biases     # (K, D)
             Qs = params.dynamics_covs       # (K, D, D)
 
-            # # Compute the log likelihoods. In pseudocode:
-            # # for t in range(T):
-            # #     for k in range(K):
-            # #         log_likes[t,k] = MVN(As[k] @ x[t-1] + bs[k], Qs[k]).log_prob(x[t])
-            # means = jnp.einsum('kde,te->tkd', As, xs[:-1]) + bs
-            # log_likes = MVN(means, Qs).log_prob(xs[1:][:, None, :]) # (T-1, K)
+            # sample xs from q(x)
+            key, *skeys = jr.split(key, n_discrete_samples+1)
+            vmap_block_tridiag_mvn_sample = vmap(block_tridiag_mvn_sample, in_axes=(0, None, None, None))
+            x_samples = vmap_block_tridiag_mvn_sample(jnp.array(skeys), J_diag, J_lower_diag, h)
 
-            # # Account for the first timestep
-            # log_likes = jnp.vstack([
-            #     MVN(jnp.zeros(D), jnp.eye(D)).log_prob(xs[0]) * jnp.ones((1, K)),
-            #     log_likes])
+            # TODO: replace with initial state distribution object
+            initial_state_distn = jnp.ones(K) / K
+            pi0 = jnp.mean(jnp.array(
+                [initial_state_distn
+                    for x in x_samples]), axis=0)
 
-            # return hmm.hmm_posterior_mode(pi0, P, log_likes)
+            # TODO: eventually, transition matrix will depend on x
+            # this should be another to call to a function that returns transition matrices
+            P = jnp.mean(jnp.array(
+                [params.transition_matrix
+                    for x in x_samples]), axis=0)
+
+            def _dynamics_likelihood(xs):
+                means = jnp.einsum('kde,te->tkd', As, xs[:-1]) + bs
+                log_likes = MVN(means, Qs).log_prob(xs[1:][:, None, :]) # (T-1, K)
+                # Account for the first timestep
+                log_likes = jnp.vstack([
+                    MVN(jnp.zeros(D), jnp.eye(D)).log_prob(xs[0]) * jnp.ones((1, K)),
+                    log_likes])
+                return log_likes
+            vmap_dynamics_likelihood = vmap(_dynamics_likelihood)
+
+            log_likes = jnp.mean(vmap_dynamics_likelihood(x_samples), axis=0)
+
+            return hmm.inference.hmm_smoother(pi0, P, log_likes)
 
             # TODO: Figure out how to return a discrete chain graphical model
 
-
-        def _update_continuous_states(zs, xs, params):
+        def _update_continuous_states(ys, zs, xs, params):
+            P = params.transition_matrix
             As = params.dynamics_matrices   # (K, D, D)
             bs = params.dynamics_biases     # (K, D)
             Qs = params.dynamics_covs       # (K, D, D)
@@ -283,26 +296,25 @@ class SLDS:
             d = params.emission_bias
             R = params.emission_cov
 
-            # Dynamax uses slightly different indexing. We need As[t] to be the
-            # dynamics matrix used to map xs[t] to xs[t+1]. In this code, As[t]
-            # maps xs[t-1] to xs[t]. We'll correct for that by padding zs with
-            # a dummy value
+            # Define log prob functions that close over zs and params
+            log_prob = lambda xs, ys: self.log_prob(ys, zs, xs, params) #TODO get access to data
 
-            # TODO: Compute expected values of these quantities for each timestep
-            zs_pad = jnp.concatenate([zs, jnp.array([0])])[1:]
-            lgssm_params = make_lgssm_params(
-                initial_mean=jnp.zeros(D),
-                initial_cov=jnp.eye(D),
-                dynamics_weights=As[zs_pad],
-                dynamics_bias=bs[zs_pad],
-                dynamics_cov=Qs[zs_pad],
-                emissions_weights=C,
-                emissions_bias=d,
-                emissions_cov=R,
-            )
+            # TODO : change these to slds object distributions
+            # TODO : marginalize over q(z)
+            initial_distribution = lambda x0: MVN(jnp.zeros(D), jnp.eye(D)).log_prob(x0)
+            dynamics_distribution = lambda t, xt, xtp1: MVN(As[zs[t+1]] @ xt + bs[zs[t+1]], Qs[zs[t+1]]).log_prob(xtp1)
+            emission_distribution = lambda t, xt, yt: MVN(C @ xt + d, R).log_prob(yt)
+            log_normalizer, Ex, ExxT, ExxnT, J_diag, J_lower_diag, h = \
+                laplace_approximation(log_prob,
+                                    initial_distribution,
+                                    dynamics_distribution,
+                                    emission_distribution,
+                                    jnp.zeros_like(xs),
+                                    ys,
+                                    method="L-BFGS",
+                                    num_iters=50)
 
-            posterior = lds.lgssm_smoother(lgssm_params, ys)
-            return posterior.smoothed_means
+            return Ex, ExxT, ExxnT, J_diag, J_lower_diag, h
 
         def _update_params(zs, xs, params):
             # Update the discrete state
@@ -350,10 +362,17 @@ class SLDS:
         # lps = jnp.stack(lps)
 
         def _step(carry, args):
-            zs, xs, params = carry
-            lp = self.log_prob(ys, zs, xs, params)
-            zs = _update_discrete_states(zs, xs, params)
-            xs = _update_continuous_states(zs, xs, params)
+            zs, xs, params, key = carry
+            Ex, ExxT, ExxnT, J_diag, J_lower_diag, h = _update_continuous_states(ys, zs, xs, params)
+            xs = Ex # redefine xs as mean
+            key, skey = jr.split(key)
+            post = _update_discrete_states(skey, params, J_diag, J_lower_diag, h)
+            zs = jnp.argmax(post.smoothed_probs, axis=1)
             params = _update_params(zs, xs, params)
-            return (zs, xs, params), lp
+            lp = self.log_prob(ys, zs, xs, params)
+            return (zs, xs, params, key), lp
 
+        initial_carry = (initial_zs, initial_xs, initial_params, key)
+        (zs, xs, params, key), lps = lax.scan(_step, initial_carry, None, length=num_iters)
+
+        return lps, zs, xs, params, key

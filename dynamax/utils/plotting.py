@@ -149,3 +149,27 @@ custom_rcparams_notebook = {
         "ytick.major.pad": 7
     }
 
+colors = COLORS
+cmap = CMAP
+
+def plot_states_and_timeseries(zs, vs, vs_std=None, spc=5):
+    T, dim = vs.shape
+    fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+    ax.imshow(zs[None, :],
+              extent=(0, T, -spc, dim * spc),
+              cmap=cmap,
+              alpha=0.5,
+              aspect="auto",
+              vmax=len(colors)-1)
+    ax.plot(vs + spc * jnp.arange(dim), '-k', lw=1)
+    if vs_std is not None:
+        for d in range(dim):
+            ax.fill_between(jnp.arange(T),
+                            vs[:, d] + spc * d - 2 * vs_std[:, d],
+                            vs[:, d] + spc * d + 2 * vs_std[:, d],
+                            color='k', alpha=0.25,
+                            )
+    ax.set_ylim(-spc, dim * spc)
+    ax.set_yticks(jnp.arange(dim) * spc)
+    ax.set_yticklabels(jnp.arange(dim))
+    return fig, ax
