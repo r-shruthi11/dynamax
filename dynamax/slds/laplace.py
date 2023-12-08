@@ -195,7 +195,6 @@ def laplace_approximation(log_prob,
     h = h.at[:-1].add(f(jnp.swapaxes(J_lower_diag, -1, -2), mu[1:]))
 
     log_normalizer, Ex, ExxT, ExxnT = block_tridiag_mvn_expectations(J_diag, J_lower_diag, h)
-    x_sample = block_tridiag_mvn_sample(jr.PRNGKey(0), J_diag, J_lower_diag, h)
 
-    # Returns log_normalizer, Ex, ExxT, ExxnT
-    return log_normalizer, Ex, ExxT, ExxnT, x_sample
+    # Returns log_normalizer, Ex, ExxT, ExxnT, and posterior params for sampling
+    return log_normalizer, Ex, ExxT, ExxnT, J_diag, J_lower_diag, h

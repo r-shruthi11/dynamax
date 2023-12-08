@@ -1,7 +1,7 @@
 from jax import vmap
 import jax.numpy as jnp
 import jax.random as jr
-
+import matplotlib.pyplot as plt
 from dynamax.slds.test_models import simulate_slds
 from dynamax.slds.laplace import laplace_approximation, block_tridiag_mvn_sample
 from tensorflow_probability.substrates import jax as tfp
@@ -49,12 +49,15 @@ if __name__ == "__main__":
     fig, ax = plot_states_and_timeseries(zs, xs)
     ax.set_xlim(0, 200)
     ax.set_title("latent states")
+    plt.show()
 
     cov_x = ExxT - jnp.einsum('ti,tj->tij', Ex, Ex)
     fig, ax = plot_states_and_timeseries(zs, Ex, jnp.sqrt(vmap(jnp.diag)(cov_x)))
     ax.set_xlim(0, 200)
     ax.set_title("inferred latent states")
+    plt.show()
 
     fig, ax = plot_states_and_timeseries(zs, x_sample)
     ax.set_xlim(0, 200)
     ax.set_title("inferred latent states")
+    plt.show()
