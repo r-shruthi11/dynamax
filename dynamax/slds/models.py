@@ -27,6 +27,7 @@ class SLDSParams:
     Note: Assume that initial distribution is uniform over discrete state
           and the standard normal over the continuous latent state
     """
+    pi0 : Float[Array, "num_states"]
     transition_matrix : Float[Array, "num_states num_states"]
     dynamics_matrices : Float[Array, "num_states latent_dim latent_dim"]
     dynamics_biases : Float[Array, "num_states latent_dim"]
@@ -44,335 +45,215 @@ class SLDS:
     def __init__(self,
                  num_states : int,
                  latent_dim : int,
-                 emission_dim : int):
+                 emission_dim : int,
+                 params : SLDSParams):
         self.num_states = num_states
         self.latent_dim = latent_dim
         self.emission_dim = emission_dim
+        self.params = params
 
-    def log_prob(self, ys, zs, xs, params):
-        P = params.transition_matrix
-        As = params.dynamics_matrices
-        bs = params.dynamics_biases
-        Qs = params.dynamics_covs
-        C = params.emission_matrix
-        d = params.emission_bias
-        R = params.emission_cov
+    def init_continuous_state_distn(self):
+        return MVN(jnp.zeros(self.latent_dim), jnp.eye(self.latent_dim))
 
+    def init_discrete_state_distn(self):
+        return tfd.Categorical(probs=self.params.pi0)
+
+    def transition_distn(self, z):
+        """
+        Currently z can be a scalar or a sequence
+        """
+        P = self.params.transition_matrix
+        return tfd.Categorical(probs=P[z])
+
+    def dynamics_distn(self, z, x):
+        As = self.params.dynamics_matrices
+        bs = self.params.dynamics_biases
+        Qs = self.params.dynamics_covs
+        return MVN(As[z] @ x + bs[z], Qs[z])
+
+    def dynamics_distributions(self, zs, xs):
+        # TODO: combine this with dynamics_distn
+        As = self.params.dynamics_matrices
+        bs = self.params.dynamics_biases
+        Qs = self.params.dynamics_covs
+        means = jnp.einsum('tde,te->td', As[zs], xs) + bs[zs]
+        return MVN(means, Qs[zs])
+
+    def emission_distn(self, x):
+        C = self.params.emission_matrix
+        d = self.params.emission_bias
+        R = self.params.emission_cov
+        return MVN(C @ x + d, R)
+
+    def emission_distributions(self, xs):
+        # TODO: combine this with emission_distn
+        C = self.params.emission_matrix
+        d = self.params.emission_bias
+        R = self.params.emission_cov
+        means = jnp.einsum('nd,td->tn', C, xs) + d
+        return MVN(means, R)
+
+    def log_prob(self, ys, zs, xs):
         lp = 0.0
         # log p(z_t | z_{t-1})
-        lp += tfd.Categorical(probs=P[zs[:-1]]).log_prob(zs[1:]).sum()
-
+        lp += self.transition_distn(zs[:-1]).log_prob(zs[1:]).sum()
         # log p(x_t | A_z x_{t-1} + b_z, Q_z)
-        means = jnp.einsum('tde,te->td', As[zs[1:]], xs[:-1]) + bs[zs[1:]]
-        lp += MVN(means, Qs[zs[1:]]).log_prob(xs[1:]).sum()
-
+        lp += self.dynamics_distributions(zs[1:], xs[:-1]).log_prob(xs[1:]).sum()
         # log p(y_t | C x_t + d, R)
-        means = jnp.einsum('nd,td->tn', C, xs) + d
-        lp += MVN(means, R).log_prob(ys).sum()
+        lp += self.emission_distributions(xs).log_prob(ys).sum()
         return lp
 
     def sample(self,
                key : jr.PRNGKey,
-               params : SLDSParams,
                num_timesteps : int):
         """
 
         """
-        # Shorthand names
-        K = self.num_states
-        D = self.latent_dim
-        N = self.emission_dim
-        P = params.transition_matrix
-        As = params.dynamics_matrices
-        bs = params.dynamics_biases
-        Qs = params.dynamics_covs
-        C = params.emission_matrix
-        d = params.emission_bias
-        R = params.emission_cov
-
         # Sample the first time steps
         k1, k2, k3, key = jr.split(key, 4)
-        z0 = tfd.Categorical(probs=jnp.ones(K) / K).sample(seed=k1)
-        x0 = MVN(jnp.zeros(D), jnp.eye(D)).sample(seed=k2)
-        y0 = MVN(C @ x0 + d, R).sample(seed=k3)
+        z0 = self.init_discrete_state_distn().sample(seed=k1)
+        x0 = self.init_continuous_state_distn().sample(seed=k2)
+        y0 = self.emission_distn(x0).sample(seed=k3)
 
         def _step(carry, key):
             zp, xp, yp = carry
             k1, k2, k3, key = jr.split(key, 4)
 
-            z = tfd.Categorical(probs=P[zp]).sample(seed=k1)
-            x = MVN(As[z] @ xp + bs[z], Qs[z]).sample(seed=k2)
-            y = MVN(C @ x + d, R).sample(seed=k3)
+            z = self.transition_distn(zp).sample(seed=k1)
+            x = self.dynamics_distn(z, xp).sample(seed=k2)
+            y = self.emission_distn(x).sample(seed=k3)
             return (z, x, y), (zp, xp, yp)
 
         _, (zs, xs, ys) = lax.scan(_step, (z0, x0, y0), jr.split(key, num_timesteps))
         return zs, xs, ys
 
-    def _fit_map(self, emissions, initial_zs, initial_xs, initial_params, num_iters=100):
-        """
-        Find the MAP estimate of parameters and states using coordinate ascent.
-        """
-        K = self.num_states
-        D = self.latent_dim
-        N = self.emission_dim
-        ys = emissions
-        T = ys.shape[0]
+def _fit_laplace_em(slds, key, emissions, initial_zs, initial_xs,
+                    num_iters=100, n_discrete_samples=1):
+    """
+    Estimate the parameters of the SLDS and an approximate posterior distr.
+    over latent states using Laplace EM. Specifically, the approximate
+    posterior factors over discrete and continuous latent states. The
+    discrete state posterior is a discrete chain graph, and the continuous
+    posterior is a linear Gaussian chain. We estimate the continuous posterior
+    using a Laplace approximation, which is appropriate when the likelihood
+    is log concave in the continuous states.
+    """
+    K = slds.num_states
+    D = slds.latent_dim
+    N = slds.emission_dim
+    ys = emissions
+    T = ys.shape[0]
 
-        def _update_discrete_states(zs, xs, params):
-            """
-            Update the discrete states to the coordinate-wise maximum using the
-            Viterbi algorithm.
-            """
-            pi0 = jnp.ones(K) / K
-            P = params.transition_matrix
-            As = params.dynamics_matrices   # (K, D, D)
-            bs = params.dynamics_biases     # (K, D)
-            Qs = params.dynamics_covs       # (K, D, D)
+    def _update_discrete_states(slds, key, J_diag, J_lower_diag, h):
+        """
+        Update the discrete states to the coordinate-wise maximum using the
+        Viterbi algorithm.
+        """
+        # sample xs from q(x)
+        key, *skeys = jr.split(key, n_discrete_samples+1)
+        vmap_block_tridiag_mvn_sample = vmap(block_tridiag_mvn_sample, in_axes=(0, None, None, None))
+        x_samples = vmap_block_tridiag_mvn_sample(jnp.array(skeys), J_diag, J_lower_diag, h)
 
-            # Compute the log likelihoods. In pseudocode:
-            # for t in range(T):
-            #     for k in range(K):
-            #         log_likes[t,k] = MVN(As[k] @ x[t-1] + bs[k], Qs[k]).log_prob(x[t])
+        pi0 = jnp.mean(jnp.array(
+            [slds.params.pi0
+                for x in x_samples]), axis=0)
+
+        # TODO: eventually, transition matrix will depend on x
+        P = jnp.mean(jnp.array(
+            [slds.params.transition_matrix
+                for x in x_samples]), axis=0)
+
+        # TODO: change this to call dynamics distribution
+        def _dynamics_likelihood(xs):
+            As = slds.params.dynamics_matrices   # (K, D, D)
+            bs = slds.params.dynamics_biases     # (K, D)
+            Qs = slds.params.dynamics_covs       # (K, D, D)
             means = jnp.einsum('kde,te->tkd', As, xs[:-1]) + bs
             log_likes = MVN(means, Qs).log_prob(xs[1:][:, None, :]) # (T-1, K)
-
             # Account for the first timestep
             log_likes = jnp.vstack([
-                MVN(jnp.zeros(D), jnp.eye(D)).log_prob(xs[0]) * jnp.ones((1, K)),
+                slds.init_continuous_state_distn().log_prob(xs[0]) * jnp.ones((1, K)),
                 log_likes])
+            return log_likes
+        vmap_dynamics_likelihood = vmap(_dynamics_likelihood)
 
-            return hmm.hmm_posterior_mode(pi0, P, log_likes)
+        log_likes = jnp.mean(vmap_dynamics_likelihood(x_samples), axis=0)
 
-        def _update_continuous_states(zs, xs, params):
-            As = params.dynamics_matrices   # (K, D, D)
-            bs = params.dynamics_biases     # (K, D)
-            Qs = params.dynamics_covs       # (K, D, D)
-            C = params.emission_matrix
-            d = params.emission_bias
-            R = params.emission_cov
+        return hmm.inference.hmm_smoother(pi0, P, log_likes)
 
-            # Dynamax uses slightly different indexing. We need As[t] to be the
-            # dynamics matrix used to map xs[t] to xs[t+1]. In this code, As[t]
-            # maps xs[t-1] to xs[t]. We'll correct for that by padding zs with
-            # a dummy value
-            zs_pad = jnp.concatenate([zs, jnp.array([0])])[1:]
-            lgssm_params = make_lgssm_params(
-                initial_mean=jnp.zeros(D),
-                initial_cov=jnp.eye(D),
-                dynamics_weights=As[zs_pad],
-                dynamics_bias=bs[zs_pad],
-                dynamics_cov=Qs[zs_pad],
-                emissions_weights=C,
-                emissions_bias=d,
-                emissions_cov=R,
-            )
+    def _update_continuous_states(slds, ys, zs, xs):
 
-            posterior = lds.lgssm_smoother(lgssm_params, ys)
-            return posterior.smoothed_means
+        # Define log prob functions that close over zs and
+        log_prob = lambda xs, ys: slds.log_prob(ys, zs, xs) #TODO get access to data
 
-        def _update_params(zs, xs, params):
-            # Update the discrete state
-            zsoh = one_hot(zs, K)
-            P = jnp.einsum('ti,tj->ij', zsoh[:-1], zsoh[1:])
-            P /= P.sum(axis=1, keepdims=True)
+        # TODO : change these to slds object distributions
+        # TODO : marginalize over q(z)
+        initial_distribution = lambda x0: slds.init_continuous_state_distn().log_prob(x0)
+        dynamics_distribution = lambda t, xt, xtp1: slds.dynamics_distn(zs[t+1], xt).log_prob(xtp1)
+        emission_distribution = lambda t, xt, yt: slds.emission_distn(xt).log_prob(yt)
+        log_normalizer, Ex, ExxT, ExxnT, J_diag, J_lower_diag, h = \
+            laplace_approximation(log_prob,
+                                initial_distribution,
+                                dynamics_distribution,
+                                emission_distribution,
+                                jnp.zeros_like(xs),
+                                ys,
+                                method="L-BFGS",
+                                num_iters=50)
 
-            # Update the dynamics parameters
-            xs_pad = jnp.column_stack([xs, jnp.ones((T, 1))])
-            ExpxpT = jnp.einsum('tk,td,te->kde', zsoh[1:], xs_pad[:-1], xs_pad[:-1])
-            ExpxT = jnp.einsum('tk,td,te->kde', zsoh[1:], xs_pad[:-1], xs[1:])
-            ExxT = jnp.einsum('tk,td,te->kde', zsoh[1:], xs[1:], xs[1:])
-            Ns = jnp.einsum('tk->k', zsoh[1:])
-            Abs, Qs = vmap(fit_linear_regression)(ExpxpT, ExpxT, ExxT, Ns)
-            As, bs = Abs[..., :-1], Abs[..., -1]
+        return Ex, ExxT, ExxnT, J_diag, J_lower_diag, h
 
-            # Update emission parameters
-            ExxT = jnp.einsum('td,te->de', xs_pad, xs_pad)
-            ExyT = jnp.einsum('td,tn->dn', xs_pad, ys)
-            EyyT = jnp.einsum('tm,tn->mn', ys, ys)
-            Cd, R = fit_linear_regression(ExxT, ExyT, EyyT, T)
-            C, d = Cd[..., :-1], Cd[..., -1]
+    def _update_params(slds, zs, xs):
 
-            # Return an updated dataclass of parameters
-            return dataclasses.replace(params,
-                                       transition_matrix=P,
-                                       dynamics_matrices=As,
-                                       dynamics_biases=bs,
-                                       dynamics_covs=Qs,
-                                       emission_matrix=C,
-                                       emission_bias=d,
-                                       emission_cov=R
-                                       )
+        # Currently, initial state distn is fixed
+        pi0 = slds.params.pi0
 
-        # Run the coordinate ascent algorithm!
-        # params = initial_params
-        # zs = initial_zs
-        # xs = initial_xs
-        # lps = []
-        # for itr in range(num_iters):
-        #     zs = _update_discrete_states(zs, xs, params)
-        #     xs = _update_continuous_states(zs, xs, params)
-        #     # params = _update_params(zs, xs, params)
-        #     lps.append(self.log_prob(ys, zs, xs, params))
-        # lps = jnp.stack(lps)
+        # Update the discrete state
+        zsoh = one_hot(zs, K)
+        P = jnp.einsum('ti,tj->ij', zsoh[:-1], zsoh[1:])
+        P /= P.sum(axis=1, keepdims=True)
 
-        def _step(carry, args):
-            zs, xs, params = carry
-            lp = self.log_prob(ys, zs, xs, params)
-            zs = _update_discrete_states(zs, xs, params)
-            xs = _update_continuous_states(zs, xs, params)
-            params = _update_params(zs, xs, params)
-            return (zs, xs, params), lp
+        # Update the dynamics parameters
+        xs_pad = jnp.column_stack([xs, jnp.ones((T, 1))])
+        ExpxpT = jnp.einsum('tk,td,te->kde', zsoh[1:], xs_pad[:-1], xs_pad[:-1])
+        ExpxT = jnp.einsum('tk,td,te->kde', zsoh[1:], xs_pad[:-1], xs[1:])
+        ExxT = jnp.einsum('tk,td,te->kde', zsoh[1:], xs[1:], xs[1:])
+        Ns = jnp.einsum('tk->k', zsoh[1:])
+        Abs, Qs = vmap(fit_linear_regression)(ExpxpT, ExpxT, ExxT, Ns)
+        As, bs = Abs[..., :-1], Abs[..., -1]
 
-        initial_carry = (initial_zs, initial_xs, initial_params)
-        (zs, xs, params), lps = lax.scan(_step, initial_carry, None, length=num_iters)
+        # Update emission parameters
+        ExxT = jnp.einsum('td,te->de', xs_pad, xs_pad)
+        ExyT = jnp.einsum('td,tn->dn', xs_pad, ys)
+        EyyT = jnp.einsum('tm,tn->mn', ys, ys)
+        Cd, R = fit_linear_regression(ExxT, ExyT, EyyT, T)
+        C, d = Cd[..., :-1], Cd[..., -1]
 
-        return lps, zs, xs, params
+        # Return updated dataclass of parameters
+        slds.params = dataclasses.replace(slds.params,
+                                    pi0 = pi0,
+                                    transition_matrix=P,
+                                    dynamics_matrices=As,
+                                    dynamics_biases=bs,
+                                    dynamics_covs=Qs,
+                                    emission_matrix=C,
+                                    emission_bias=d,
+                                    emission_cov=R
+                                    )
+        return
 
-    def _fit_laplace_em(self, key, emissions, initial_zs, initial_xs, initial_params,
-                        num_iters=100, n_discrete_samples=1):
-        """
-        Estimate the parameters of the SLDS and an approximate posterior distr.
-        over latent states using Laplace EM. Specifically, the approximate
-        posterior factors over discrete and continuous latent states. The
-        discrete state posterior is a discrete chain graph, and the continuous
-        posterior is a linear Gaussian chain. We estimate the continuous posterior
-        using a Laplace approximation, which is appropriate when the likelihood
-        is log concave in the continuous states.
-        """
-        K = self.num_states
-        D = self.latent_dim
-        N = self.emission_dim
-        ys = emissions
-        T = ys.shape[0]
+    def _step(carry, args):
+        zs, xs, key = carry
+        Ex, ExxT, ExxnT, J_diag, J_lower_diag, h = _update_continuous_states(slds, ys, zs, xs)
+        xs = Ex # redefine xs as mean
+        key, skey = jr.split(key)
+        post = _update_discrete_states(slds, skey, J_diag, J_lower_diag, h)
+        zs = jnp.argmax(post.smoothed_probs, axis=1)
+        _update_params(slds, zs, xs)
+        lp = slds.log_prob(ys, zs, xs)
+        return (zs, xs, key), lp
 
-        def _update_discrete_states(key, params, J_diag, J_lower_diag, h):
-            """
-            Update the discrete states to the coordinate-wise maximum using the
-            Viterbi algorithm.
-            """
-            As = params.dynamics_matrices   # (K, D, D)
-            bs = params.dynamics_biases     # (K, D)
-            Qs = params.dynamics_covs       # (K, D, D)
+    initial_carry = (initial_zs, initial_xs, key)
+    (zs, xs, key), lps = lax.scan(_step, initial_carry, None, length=num_iters)
 
-            # sample xs from q(x)
-            key, *skeys = jr.split(key, n_discrete_samples+1)
-            vmap_block_tridiag_mvn_sample = vmap(block_tridiag_mvn_sample, in_axes=(0, None, None, None))
-            x_samples = vmap_block_tridiag_mvn_sample(jnp.array(skeys), J_diag, J_lower_diag, h)
-
-            # TODO: replace with initial state distribution object
-            initial_state_distn = jnp.ones(K) / K
-            pi0 = jnp.mean(jnp.array(
-                [initial_state_distn
-                    for x in x_samples]), axis=0)
-
-            # TODO: eventually, transition matrix will depend on x
-            # this should be another to call to a function that returns transition matrices
-            P = jnp.mean(jnp.array(
-                [params.transition_matrix
-                    for x in x_samples]), axis=0)
-
-            def _dynamics_likelihood(xs):
-                means = jnp.einsum('kde,te->tkd', As, xs[:-1]) + bs
-                log_likes = MVN(means, Qs).log_prob(xs[1:][:, None, :]) # (T-1, K)
-                # Account for the first timestep
-                log_likes = jnp.vstack([
-                    MVN(jnp.zeros(D), jnp.eye(D)).log_prob(xs[0]) * jnp.ones((1, K)),
-                    log_likes])
-                return log_likes
-            vmap_dynamics_likelihood = vmap(_dynamics_likelihood)
-
-            log_likes = jnp.mean(vmap_dynamics_likelihood(x_samples), axis=0)
-
-            return hmm.inference.hmm_smoother(pi0, P, log_likes)
-
-            # TODO: Figure out how to return a discrete chain graphical model
-
-        def _update_continuous_states(ys, zs, xs, params):
-            P = params.transition_matrix
-            As = params.dynamics_matrices   # (K, D, D)
-            bs = params.dynamics_biases     # (K, D)
-            Qs = params.dynamics_covs       # (K, D, D)
-            C = params.emission_matrix
-            d = params.emission_bias
-            R = params.emission_cov
-
-            # Define log prob functions that close over zs and params
-            log_prob = lambda xs, ys: self.log_prob(ys, zs, xs, params) #TODO get access to data
-
-            # TODO : change these to slds object distributions
-            # TODO : marginalize over q(z)
-            initial_distribution = lambda x0: MVN(jnp.zeros(D), jnp.eye(D)).log_prob(x0)
-            dynamics_distribution = lambda t, xt, xtp1: MVN(As[zs[t+1]] @ xt + bs[zs[t+1]], Qs[zs[t+1]]).log_prob(xtp1)
-            emission_distribution = lambda t, xt, yt: MVN(C @ xt + d, R).log_prob(yt)
-            log_normalizer, Ex, ExxT, ExxnT, J_diag, J_lower_diag, h = \
-                laplace_approximation(log_prob,
-                                    initial_distribution,
-                                    dynamics_distribution,
-                                    emission_distribution,
-                                    jnp.zeros_like(xs),
-                                    ys,
-                                    method="L-BFGS",
-                                    num_iters=50)
-
-            return Ex, ExxT, ExxnT, J_diag, J_lower_diag, h
-
-        def _update_params(zs, xs, params):
-            # Update the discrete state
-            zsoh = one_hot(zs, K)
-            P = jnp.einsum('ti,tj->ij', zsoh[:-1], zsoh[1:])
-            P /= P.sum(axis=1, keepdims=True)
-
-            # Update the dynamics parameters
-            xs_pad = jnp.column_stack([xs, jnp.ones((T, 1))])
-            ExpxpT = jnp.einsum('tk,td,te->kde', zsoh[1:], xs_pad[:-1], xs_pad[:-1])
-            ExpxT = jnp.einsum('tk,td,te->kde', zsoh[1:], xs_pad[:-1], xs[1:])
-            ExxT = jnp.einsum('tk,td,te->kde', zsoh[1:], xs[1:], xs[1:])
-            Ns = jnp.einsum('tk->k', zsoh[1:])
-            Abs, Qs = vmap(fit_linear_regression)(ExpxpT, ExpxT, ExxT, Ns)
-            As, bs = Abs[..., :-1], Abs[..., -1]
-
-            # Update emission parameters
-            ExxT = jnp.einsum('td,te->de', xs_pad, xs_pad)
-            ExyT = jnp.einsum('td,tn->dn', xs_pad, ys)
-            EyyT = jnp.einsum('tm,tn->mn', ys, ys)
-            Cd, R = fit_linear_regression(ExxT, ExyT, EyyT, T)
-            C, d = Cd[..., :-1], Cd[..., -1]
-
-            # Return an updated dataclass of parameters
-            return dataclasses.replace(params,
-                                       transition_matrix=P,
-                                       dynamics_matrices=As,
-                                       dynamics_biases=bs,
-                                       dynamics_covs=Qs,
-                                       emission_matrix=C,
-                                       emission_bias=d,
-                                       emission_cov=R
-                                       )
-
-        # Run the coordinate ascent algorithm!
-        # params = initial_params
-        # zs = initial_zs
-        # xs = initial_xs
-        # lps = []
-        # for itr in range(num_iters):
-        #     zs = _update_discrete_states(zs, xs, params)
-        #     xs = _update_continuous_states(zs, xs, params)
-        #     # params = _update_params(zs, xs, params)
-        #     lps.append(self.log_prob(ys, zs, xs, params))
-        # lps = jnp.stack(lps)
-
-        def _step(carry, args):
-            zs, xs, params, key = carry
-            Ex, ExxT, ExxnT, J_diag, J_lower_diag, h = _update_continuous_states(ys, zs, xs, params)
-            xs = Ex # redefine xs as mean
-            key, skey = jr.split(key)
-            post = _update_discrete_states(skey, params, J_diag, J_lower_diag, h)
-            zs = jnp.argmax(post.smoothed_probs, axis=1)
-            params = _update_params(zs, xs, params)
-            lp = self.log_prob(ys, zs, xs, params)
-            return (zs, xs, params, key), lp
-
-        initial_carry = (initial_zs, initial_xs, initial_params, key)
-        (zs, xs, params, key), lps = lax.scan(_step, initial_carry, None, length=num_iters)
-
-        return lps, zs, xs, params, key
+    return lps, zs, xs, key
