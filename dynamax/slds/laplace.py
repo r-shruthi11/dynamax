@@ -1,26 +1,15 @@
-import dataclasses
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import matplotlib.pyplot as plt
-import seaborn as sns
 
-from jax import grad, jit, vmap, lax
-from jax.nn import one_hot
-from jax.scipy.linalg import cho_factor, cho_solve
-from jaxtyping import Array, Float, PyTree
-from tqdm.auto import trange
+from jax import jit, vmap, lax
 from tensorflow_probability.substrates import jax as tfp
 
 tfd = tfp.distributions
 tfb = tfp.bijectors
 MVN = tfd.MultivariateNormalFullCovariance
 
-from dynamax import hidden_markov_model as hmm
-from dynamax import linear_gaussian_ssm as lds
-from dynamax.linear_gaussian_ssm.inference import make_lgssm_params
 
-from dynamax.utils.utils import register_pytree_node_dataclass, fit_linear_regression
 
 import optax
 import jax.scipy.optimize
